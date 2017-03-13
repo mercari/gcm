@@ -9,13 +9,22 @@ import (
 	"fmt"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"time"
 )
 
 const (
-	// GcmSendEndpoint is the endpoint for sending messages to the GCM server.
-	GcmSendEndpoint = "https://gcm-http.googleapis.com/gcm/send"
+	// FCMSendEndpoint is the endpoint for sending message to the Firebase Cloud Messaging (FCM).
+	// See more on https://firebase.google.com/docs/cloud-messaging/server
+	FCMSendEndpoint = "https://fcm.googleapis.com/fcm/senda"
 
+	// GcmSendEndpoint is the endpoint for sending messages to the GCM server.
+	// Firebase Cloud Messaging (FCM) is the new version of GCM. Should use new endpoint.
+	// See more on https://firebase.google.com/support/faq/#gcm-fcm
+	GcmSendEndpoint = "https://gcm-http.googleapis.com/gcm/send"
+)
+
+const (
 	// Initial delay before first retry, without jitter.
 	backoffInitialDelay = 1000
 
@@ -30,7 +39,8 @@ const (
 )
 
 // Declared as a mutable variable for testing purposes.
-var gcmSendEndpoint = GcmSendEndpoint
+// Use GCMEndpoint by default for backward compatibility.
+var defaultEndpoint = GcmSendEndpoint
 
 // Sender abstracts the interaction between the application server and the
 // GCM server. The developer must obtain an API key from the Google APIs
@@ -52,7 +62,32 @@ var gcmSendEndpoint = GcmSendEndpoint
 //	}
 type Sender struct {
 	ApiKey string
+	URL    string
 	Http   *http.Client
+}
+
+// NewClient returns a new sender with the given URL and apiKey.
+// If one of input is empty or URL is malformed, returns error.
+// It sets http.DefaultHTTP client for http connection to server.
+// If you need our own configuration overwrite it.
+func NewClient(urlString, apiKey string) (*Sender, error) {
+	if len(urlString) == 0 {
+		return nil, fmt.Errorf("missing GCM/FCM endpoint url")
+	}
+
+	if len(apiKey) == 0 {
+		return nil, fmt.Errorf("missing API Key")
+	}
+
+	if _, err := url.Parse(urlString); err != nil {
+		return nil, fmt.Errorf("failed to parse URL %q: %s", urlString, err)
+	}
+
+	return &Sender{
+		URL:    urlString,
+		ApiKey: apiKey,
+		Http:   http.DefaultClient,
+	}, nil
 }
 
 // SendNoRetry sends a message to the GCM server without retrying in case of
@@ -141,7 +176,7 @@ func (s *Sender) send(msg *Message) (*Response, error) {
 		return nil, err
 	}
 
-	req, err := http.NewRequest("POST", gcmSendEndpoint, &buf)
+	req, err := http.NewRequest("POST", s.URL, &buf)
 	if err != nil {
 		return nil, err
 	}
@@ -198,8 +233,15 @@ func checkSender(sender *Sender) error {
 	if sender.ApiKey == "" {
 		return errors.New("the sender's API key must not be empty")
 	}
+
 	if sender.Http == nil {
 		sender.Http = new(http.Client)
+	}
+
+	// Previously, by default, this library uses gcm endpoint.
+	// To keep backwards compatibility, use GCM endpoint when not specified.
+	if sender.URL == "" {
+		sender.URL = defaultEndpoint
 	}
 	return nil
 }
