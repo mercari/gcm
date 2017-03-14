@@ -31,7 +31,7 @@ func startTestServer(t *testing.T, responses []*testResponse) *httptest.Server {
 		i++
 	}
 	server := httptest.NewServer(http.HandlerFunc(handler))
-	gcmSendEndpoint = server.URL
+	defaultEndpoint = server.URL
 	return server
 }
 
@@ -167,14 +167,13 @@ func TestSend(t *testing.T) {
 
 	for i, tc := range cases {
 		server := startTestServer(t, tc.serverResponses)
-		sender := &Sender{ApiKey: "test"}
+		sender, err := NewClient(server.URL, "testAPIKey")
+		if err != nil {
+			t.Fatalf("Failed to setup sender client: %s", err)
+		}
+
+		var resp *Response
 		msg := NewMessage(map[string]interface{}{"key": "value"}, "1")
-
-		var (
-			resp *Response
-			err  error
-		)
-
 		if tc.retry == 0 {
 			resp, err = sender.SendNoRetry(msg)
 		} else {
