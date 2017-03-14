@@ -7,24 +7,40 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"math/rand"
 	"net/http"
+	"net/url"
 	"time"
 )
 
 const (
+	// FCMSendEndpoint is the endpoint for sending message to the Firebase Cloud Messaging (FCM).
+	// See more on https://firebase.google.com/docs/cloud-messaging/server
+	FCMSendEndpoint = "https://fcm.googleapis.com/fcm/senda"
+
 	// GcmSendEndpoint is the endpoint for sending messages to the GCM server.
-	//GcmSendEndpoint = "https://android.googleapis.com/gcm/send"
+	// Firebase Cloud Messaging (FCM) is the new version of GCM. Should use new endpoint.
+	// See more on https://firebase.google.com/support/faq/#gcm-fcm
 	GcmSendEndpoint = "https://gcm-http.googleapis.com/gcm/send"
+)
+
+const (
 	// Initial delay before first retry, without jitter.
 	backoffInitialDelay = 1000
+
 	// Maximum delay before a retry.
 	maxBackoffDelay = 1024000
+
+	// maxRegistrationIDs are max number of registration IDs in one message.
+	maxRegistrationIDs = 1000
+
+	// maxTimeToLive is max time GCM storage can store messages when the device is offline
+	maxTimeToLive = 2419200 // 4 weeks
 )
 
 // Declared as a mutable variable for testing purposes.
-var gcmSendEndpoint = GcmSendEndpoint
+// Use GCMEndpoint by default for backward compatibility.
+var defaultEndpoint = GcmSendEndpoint
 
 // Sender abstracts the interaction between the application server and the
 // GCM server. The developer must obtain an API key from the Google APIs
@@ -46,7 +62,32 @@ var gcmSendEndpoint = GcmSendEndpoint
 //	}
 type Sender struct {
 	ApiKey string
+	URL    string
 	Http   *http.Client
+}
+
+// NewClient returns a new sender with the given URL and apiKey.
+// If one of input is empty or URL is malformed, returns error.
+// It sets http.DefaultHTTP client for http connection to server.
+// If you need our own configuration overwrite it.
+func NewClient(urlString, apiKey string) (*Sender, error) {
+	if len(urlString) == 0 {
+		return nil, fmt.Errorf("missing GCM/FCM endpoint url")
+	}
+
+	if len(apiKey) == 0 {
+		return nil, fmt.Errorf("missing API Key")
+	}
+
+	if _, err := url.Parse(urlString); err != nil {
+		return nil, fmt.Errorf("failed to parse URL %q: %s", urlString, err)
+	}
+
+	return &Sender{
+		URL:    urlString,
+		ApiKey: apiKey,
+		Http:   http.DefaultClient,
+	}, nil
 }
 
 // SendNoRetry sends a message to the GCM server without retrying in case of
@@ -59,36 +100,7 @@ func (s *Sender) SendNoRetry(msg *Message) (*Response, error) {
 		return nil, err
 	}
 
-	data, err := json.Marshal(msg)
-	if err != nil {
-		return nil, err
-	}
-
-	req, err := http.NewRequest("POST", gcmSendEndpoint, bytes.NewBuffer(data))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Add("Authorization", fmt.Sprintf("key=%s", s.ApiKey))
-	req.Header.Add("Content-Type", "application/json")
-
-	resp, err := s.Http.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("%d error: %s", resp.StatusCode, resp.Status)
-	}
-
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	response := new(Response)
-	err = json.Unmarshal(body, response)
-	return response, err
+	return s.send(msg)
 }
 
 // Send sends a message to the GCM server, retrying in case of service
@@ -107,7 +119,7 @@ func (s *Sender) Send(msg *Message, retries int) (*Response, error) {
 	}
 
 	// Send the message for the first time.
-	resp, err := s.SendNoRetry(msg)
+	resp, err := s.send(msg)
 	if err != nil {
 		return nil, err
 	} else if resp.Failure == 0 || retries == 0 {
@@ -122,7 +134,7 @@ func (s *Sender) Send(msg *Message, retries int) (*Response, error) {
 		sleepTime := backoff/2 + rand.Intn(backoff)
 		time.Sleep(time.Duration(sleepTime) * time.Millisecond)
 		backoff = min(2*backoff, maxBackoffDelay)
-		if resp, err = s.SendNoRetry(msg); err != nil {
+		if resp, err = s.send(msg); err != nil {
 			msg.RegistrationIDs = regIDs
 			return nil, err
 		}
@@ -157,6 +169,39 @@ func (s *Sender) Send(msg *Message, retries int) (*Response, error) {
 	}, nil
 }
 
+func (s *Sender) send(msg *Message) (*Response, error) {
+	var buf bytes.Buffer
+	encoder := json.NewEncoder(&buf)
+	if err := encoder.Encode(msg); err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest("POST", s.URL, &buf)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Add("Authorization", fmt.Sprintf("key=%s", s.ApiKey))
+	req.Header.Add("Content-Type", "application/json")
+
+	resp, err := s.Http.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("invalid status code %d: %s", resp.StatusCode, resp.Status)
+	}
+
+	var response Response
+	decoder := json.NewDecoder(resp.Body)
+	if err := decoder.Decode(&response); err != nil {
+		return nil, err
+	}
+
+	return &response, err
+}
+
 // updateStatus updates the status of the messages sent to devices and
 // returns the number of recoverable errors that could be retried.
 func updateStatus(msg *Message, resp *Response, allResults map[string]Result) int {
@@ -188,8 +233,15 @@ func checkSender(sender *Sender) error {
 	if sender.ApiKey == "" {
 		return errors.New("the sender's API key must not be empty")
 	}
+
 	if sender.Http == nil {
 		sender.Http = new(http.Client)
+	}
+
+	// Previously, by default, this library uses gcm endpoint.
+	// To keep backwards compatibility, use GCM endpoint when not specified.
+	if sender.URL == "" {
+		sender.URL = defaultEndpoint
 	}
 	return nil
 }
@@ -202,9 +254,9 @@ func checkMessage(msg *Message) error {
 		return errors.New("the message's RegistrationIDs field must not be nil")
 	} else if len(msg.RegistrationIDs) == 0 {
 		return errors.New("the message must specify at least one registration ID")
-	} else if len(msg.RegistrationIDs) > 1000 {
+	} else if len(msg.RegistrationIDs) > maxRegistrationIDs {
 		return errors.New("the message may specify at most 1000 registration IDs")
-	} else if msg.TimeToLive < 0 || 2419200 < msg.TimeToLive {
+	} else if msg.TimeToLive < 0 || maxTimeToLive < msg.TimeToLive {
 		return errors.New("the message's TimeToLive field must be an integer " +
 			"between 0 and 2419200 (4 weeks)")
 	}
